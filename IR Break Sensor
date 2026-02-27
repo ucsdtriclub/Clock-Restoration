@@ -1,0 +1,52 @@
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+
+#define SENSOR_PIN 2  // IR break beam sensor pin
+
+Adafruit_AHTX0 aht;
+
+volatile bool sensor_triggered_flag = false;
+unsigned long t1 = 0;
+unsigned long t2 = 0;
+unsigned long dt = 0;
+
+void setup() {
+    Serial.begin(9600);
+
+    // Initialize AHT20 sensor
+    if (!aht.begin()) {
+        Serial.println("Failed to find AHT20 sensor!");
+        while (1);
+    }
+
+    // IR break beam setup
+    pinMode(SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), sensor_triggered, FALLING);
+
+    // Print CSV header
+    Serial.println("Time_ms,DeltaT_ms,Temp_C");
+}
+
+void loop() {
+    if (sensor_triggered_flag) {
+        sensor_triggered_flag = false;
+
+        t2 = millis();
+        dt = t2 - t1;
+
+        if (dt < 150) return;  // Debounce: ignore events too close together
+
+        t1 = t2;
+
+        // Read temperature
+        sensors_event_t humidity, temp;
+        aht.getEvent(&humidity, &temp);
+
+        // Print CSV row
+        Serial.print(t2);
+        Serial.print(",");
+        Serial.print(dt);
+        Serial.print(",");
+        Serial.println(temp.temperature);
+    }
+}
