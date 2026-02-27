@@ -1,3 +1,4 @@
+%Pasted onto Github by Diego Abarca 2/27/25 2:48
 #include <MPU6050_tockn.h>
 #include <Wire.h>
 
