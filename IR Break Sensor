@@ -1,3 +1,4 @@
+%Pasted to Github by Diego Abarca 2/27/25 2:49
 #include <Wire.h>
 #include <Adafruit_AHTX0.h>
 
