@@ -1,0 +1,258 @@
+%Pasted by Diego Abarca 2/27/29 3:11
+function DualSensorLoggerGUI()
+   % === USER CONFIGURATION ===
+   baudRate = 9600;
+   maxDataPoints = 30000000;
+   % === EMAIL SETTINGS ===
+   props = java.lang.System.getProperties;
+   props.setProperty('mail.smtp.auth','true');
+   props.setProperty('mail.smtp.socketFactory.class', 'javax.net.ssl.SSLSocketFactory');
+   props.setProperty('mail.smtp.socketFactory.port','465');
+   % No camera now
+   cameraRecording = false; %#ok<NASGU>
+   camObj = [];             %#ok<NASGU>
+   videoWriter = [];        %#ok<NASGU>
+   % === SERIAL PORTS ===
+   s1 = serialport("COM3", baudRate); % IR + Temp
+   configureTerminator(s1, "LF"); flush(s1); pause(1); readline(s1);
+   s2 = serialport("COM4", baudRate); % Accelerometer
+   configureTerminator(s2, "LF"); flush(s2);
+   % === GUI SETUP ===
+   % Centered window
+   screenSize = get(0,'ScreenSize');      % [left bottom width height]
+   figWidth   = 1250;
+   figHeight  = 750;
+   figLeft    = (screenSize(3)-figWidth)/2;
+   figBottom  = (screenSize(4)-figHeight)/2;
+   fig = uifigure('Name', 'Dual Sensor Logger', ...
+                  'Position', [figLeft figBottom figWidth figHeight]);
+   % Time‑domain plots
+   ax1 = uiaxes(fig, 'Position', [50 470 700 160]);   % Temperature
+   ax2 = uiaxes(fig, 'Position', [50 280 700 160]);   % Accelerometer
+   ax3 = uiaxes(fig, 'Position', [50 100 700 120]);   % Gear detections
+   % FFT axes (IR escapement) – uses right-hand area
+   axFFT = uiaxes(fig, 'Position', [800 120 400 400]);
+   title(axFFT, 'Escapement FFT (IR)');
+   xlabel(axFFT, 'Frequency (Hz)');
+   ylabel(axFFT, 'Amplitude');
+   grid(axFFT, 'on');
+    timeLabel = uilabel(fig, ...
+   'Position', [880 690 250 22], ...
+   'Text', 'Inactivity: 0s');
+   % 2 columns × 2 rows of buttons in the top‑right
+   btnResume = uibutton(fig, 'Text', 'Start Logging', ...
+       'Position', [880 650 150 30], ...
+       'ButtonPushedFcn', @(btn,event) resumeLogging());
+   btnPause = uibutton(fig, 'Text', 'Pause Logging', ...
+       'Position', [1060 650 150 30], ...
+       'ButtonPushedFcn', @(btn,event) pauseLogging());
+   btnReset = uibutton(fig, 'Text', 'Reset Logging', ...
+       'Position', [880 610 150 30], ...
+       'ButtonPushedFcn', @(btn,event) resetLogging());
+   btnSave = uibutton(fig, 'Text', 'Save Combined CSV', ...
+       'Position', [1060 610 150 30], ...
+       'ButtonPushedFcn', @(btn,event) saveCombined());
+   tempData  = [];
+   accelData = [];
+   % IR break timestamps and FFT params
+   breakTimes_ms   = [];   % IR break timestamps (ms)
+   FsFFT           = 100;  % sampling rate for impulse-train FFT (Hz)
+   NminEventsFFT   = 8;    % minimum events before FFT plotted
+   maxEventsFFT    = 200;  % max recent events for FFT window
+   startTime = [];
+   lastBreakClock = tic();
+   t = timer('ExecutionMode', 'fixedSpacing', 'Period', 0.1, ...
+             'TimerFcn', @(~,~) readBoth());
+   fig.CloseRequestFcn = @(src, event) cleanupAndClose();
+   % =====================================================================
+   function readBoth()
+       if isempty(startTime), return; end
+       % ====== IR + Temp (COM3) ======
+       while s1.NumBytesAvailable > 0
+           line = strtrim(readline(s1));
+           vals = str2double(split(line, ","));
+           % Expect: [t_ms, deltaT, tempC]
+           if numel(vals) == 3 && all(~isnan(vals))
+               tempData(end+1, :) = vals';
+               t_ms = vals(1);
+               % log IR break event time for FFT
+               breakTimes_ms(end+1,1) = t_ms;
+               % Limit tempData length
+               if size(tempData, 1) > maxDataPoints
+                   tempData = tempData(end-maxDataPoints+1:end, :);
+               end
+               % Temperature plot
+               time_s = (tempData(:,1) - tempData(1,1)) / 1000;
+               tempF  = (tempData(:,3) * 9/5) + 32;
+               if numel(time_s) > 1
+                   plot(ax1, time_s, tempF, '-o');
+               end
+               title(ax1, 'Temperature (°F)');
+               xlabel(ax1, 'Time (s)');
+               ylabel(ax1, 'Temp (°F)');
+               grid(ax1, 'on');
+               % Gear detections stem
+               if ~isempty(breakTimes_ms)
+                   t_break_s = (breakTimes_ms - breakTimes_ms(1))/1000;
+                   stem(ax3, t_break_s, ones(size(t_break_s)), 'filled');
+               end
+               title(ax3, 'Gear Detections');
+               xlabel(ax3, 'Time (s)');
+               ylabel(ax3, 'Break');
+               ylim(ax3, [0 1.2]);
+               grid(ax3, 'on');
+               lastBreakClock = tic();
+           end
+       end
+       % Inactivity detection
+       timeLabel.Text = sprintf('Inactivity: %.0fs', toc(lastBreakClock));
+       if toc(lastBreakClock) > 60
+           stop(t);
+           btnResume.Enable = 'on';
+           btnPause.Enable  = 'off';
+           btnReset.Enable  = 'on';
+           uialert(fig, 'No gear detected for 60 seconds. Logging stopped.', 'Auto Stop');
+           recipient = 'daquan@ucsd.edu';
+           try
+               sendmail(recipient, ...
+                   'Data Logging Stopped', ...
+                   'The data logging was stopped due to 60 seconds of inactivity.');
+               fprintf('Email sent to %s\n', recipient);
+           catch e
+               warning('Email to %s failed: %s', recipient, e.message);
+           end
+       end
+       % ====== Accelerometer (COM6) ======
+       while s2.NumBytesAvailable > 0
+           line = strtrim(readline(s2));
+           vals = str2double(split(line, ","));
+           if numel(vals) == 4 && all(~isnan(vals))
+               accelData(end+1, :) = vals';
+               if mod(size(accelData,1), 5) == 0
+                   t_s = (accelData(:,1) - accelData(1,1)) / 1000;
+                   plot(ax2, t_s, accelData(:,2), 'r'); hold(ax2, 'on');
+                   plot(ax2, t_s, accelData(:,3), 'g');
+                   plot(ax2, t_s, accelData(:,4), 'b'); hold(ax2, 'off');
+                   legend(ax2, {'Angle X', 'Angle Y', 'Angle Z'});
+                   title(ax2, 'Accelerometer Angles');
+                   xlabel(ax2, 'Time (s)');
+                   ylabel(ax2, 'Angle (°)');
+                   grid(ax2, 'on');
+               end
+           end
+       end
+       title(ax2, 'Accelerometer Angles');
+       xlabel(ax2, 'Time (s)');
+       ylabel(ax2, 'Angle (°)');
+       grid(ax2, 'on');
+       % ====== Escapement FFT from IR events ======
+       if numel(breakTimes_ms) >= NminEventsFFT
+           % Use only most recent maxEventsFFT events for sliding window
+           if numel(breakTimes_ms) > maxEventsFFT
+               useIdx = numel(breakTimes_ms)-maxEventsFFT+1 : numel(breakTimes_ms);
+               bt = breakTimes_ms(useIdx);
+           else
+               bt = breakTimes_ms;
+           end
+           t0   = bt(1)/1000;   % s
+           tEnd = bt(end)/1000; % s
+           Tobs = tEnd - t0;
+           if Tobs > 0
+               Tfft = 1/FsFFT;
+               t_uniform = t0:Tfft:tEnd;
+               L = numel(t_uniform);
+               if L >= 16
+                   sig = zeros(L,1);
+                   bt_s = bt/1000;
+                   % map each event to nearest sample index
+                   for k = 1:numel(bt_s)
+                       idx = round((bt_s(k) - t0)/Tfft) + 1;
+                       if idx >= 1 && idx <= L
+                           sig(idx) = 1;
+                       end
+                   end
+                   % remove DC so tick line stands out
+                   sig = sig - mean(sig);
+                   % FFT
+                   Nfft = 2^nextpow2(L);
+                   X = fft(sig, Nfft);
+                   P2 = abs(X/Nfft);
+                   P1 = P2(1:Nfft/2+1);
+                   P1(2:end-1) = 2*P1(2:end-1);
+                   f = FsFFT*(0:Nfft/2)/Nfft;
+                   % plot spectrum
+                   plot(axFFT, f, P1);
+                   xlim(axFFT, [0 FsFFT/2]);
+                   title(axFFT, 'Escapement FFT (IR)');
+                   xlabel(axFFT, 'Frequency (Hz)');
+                   ylabel(axFFT, 'Amplitude');
+                   grid(axFFT, 'on');
+               end
+           end
+       end
+   end
+   function resumeLogging()
+       if isempty(startTime)
+           startTime = datetime('now');
+           fprintf('Logging started at %s\n', datestr(startTime));
+       end
+       if strcmp(t.Running, "off")
+           lastBreakClock = tic();
+           fprintf('Logging resumed at %s\n', datestr(datetime('now')));
+           start(t);
+           btnPause.Enable  = 'on';
+           btnResume.Enable = 'off';
+       end
+   end
+   function pauseLogging()
+       if strcmp(t.Running, "on")
+           stop(t);
+           fprintf('Logging paused at %s\n', datestr(datetime('now')));
+           btnPause.Enable  = 'off';
+           btnResume.Enable = 'on';
+       end
+   end
+   function resetLogging()
+       tempData(:)      = [];
+       accelData(:)     = [];
+       breakTimes_ms(:) = [];
+       lastBreakClock   = tic();
+       startTime        = [];
+       fprintf('Logging reset at %s\n', datestr(datetime('now')));
+       stop(t);
+       btnResume.Enable = 'on';
+       btnPause.Enable  = 'off';
+   end
+   function saveCombined()
+       if isempty(tempData) && isempty(accelData)
+           uialert(fig, 'No data to save!', 'Warning'); return;
+       end
+       endTime = datetime('now');
+       fprintf('Logging ended at %s\n', datestr(endTime));
+       timestamp   = datestr(startTime, 'yyyymmdd_HHMMSS');
+       defaultName = sprintf('combined_data_%s.csv', timestamp);
+       filename    = uiputfile(defaultName, 'Save CSV');
+       if ~filename, return; end
+       t0 = min([tempData(:,1); accelData(:,1)]);
+       allTimes = unique([tempData(:,1); accelData(:,1)]);
+       tempInterp  = interp1(tempData(:,1), (tempData(:,3) * 9/5 + 32), allTimes, 'linear', NaN);
+       deltaInterp = interp1(tempData(:,1), tempData(:,2), allTimes, 'linear', NaN);
+       angleX      = interp1(accelData(:,1), accelData(:,2), allTimes, 'linear', NaN);
+       angleY      = interp1(accelData(:,1), accelData(:,3), allTimes, 'linear', NaN);
+       angleZ      = interp1(accelData(:,1), accelData(:,4), allTimes, 'linear', NaN);
+       startCol = repmat(string(datestr(startTime)), numel(allTimes), 1);
+       endCol   = repmat(string(datestr(endTime)),   numel(allTimes), 1);
+       T = table(startCol, endCol, (allTimes - t0)/1000, ...
+                 deltaInterp, tempInterp, angleX, angleY, angleZ, ...
+                 'VariableNames', ...
+                 {'StartTime','EndTime','Time_s','DeltaT_ms','Temp_F', ...
+                  'AngleX','AngleY','AngleZ'});
+       writetable(T, filename);
+       uialert(fig, 'Data saved successfully!', 'Done');
+   end
+   function cleanupAndClose()
+       stop(t);
+       delete(t);
+       delete(fig);
+   end
+end
